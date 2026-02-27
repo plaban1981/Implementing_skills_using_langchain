@@ -63,6 +63,21 @@ def _c(colour: str, text: str) -> str:
 # LLM HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Global token accumulator for create_skill pipeline ──────────────────────
+# Reset at the start of each create_skill_programmatic() call.
+_CREATE_TOKENS: Dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def _reset_token_counter():
+    global _CREATE_TOKENS
+    _CREATE_TOKENS = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def get_create_token_usage() -> Dict:
+    """Return a copy of the accumulated token usage for the last skill creation."""
+    return dict(_CREATE_TOKENS)
+
+
 def _extract_text(content) -> str:
     """
     Safely extract plain text from any Gemini/LangChain content format.
@@ -87,6 +102,29 @@ def _extract_text(content) -> str:
     return str(content).strip()
 
 
+def _accumulate_tokens(response) -> Dict:
+    """Extract token counts from a response and add them to the global counter."""
+    global _CREATE_TOKENS
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    meta  = getattr(response, "response_metadata", {}) or {}
+    um    = meta.get("usage_metadata") or meta.get("token_counts") or {}
+    if um:
+        usage["input_tokens"]  = um.get("prompt_token_count")     or um.get("input_tokens",  0)
+        usage["output_tokens"] = um.get("candidates_token_count") or um.get("output_tokens", 0)
+        usage["total_tokens"]  = um.get("total_token_count")       or um.get("total_tokens",  0)
+    if usage["total_tokens"] == 0 and hasattr(response, "usage_metadata"):
+        umd = response.usage_metadata or {}
+        usage["input_tokens"]  = umd.get("input_tokens",  0)
+        usage["output_tokens"] = umd.get("output_tokens", 0)
+        usage["total_tokens"]  = umd.get("total_tokens",  0)
+    if usage["total_tokens"] == 0:
+        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    _CREATE_TOKENS["input_tokens"]  += usage["input_tokens"]
+    _CREATE_TOKENS["output_tokens"] += usage["output_tokens"]
+    _CREATE_TOKENS["total_tokens"]  += usage["total_tokens"]
+    return usage
+
+
 def _llm_call(system: str, user: str, temperature: float = 0.2) -> str:
     api_key = os.environ.get("GOOGLE_API_KEY", "")
     if not api_key:
@@ -104,6 +142,7 @@ def _llm_call(system: str, user: str, temperature: float = 0.2) -> str:
         SystemMessage(content=system),
         HumanMessage(content=user),
     ])
+    _accumulate_tokens(response)
     return _extract_text(response.content)
 
 
@@ -619,12 +658,16 @@ def create_skill_programmatic(
     """
     Non-interactive entry point for app.py / test_agent.py.
     Builds brief from description, runs full pipeline, returns result dict.
+    Also returns token_usage dict with total tokens consumed across all LLM calls.
     """
+    _reset_token_counter()          # start fresh for this creation run
     creator = SkillCreator()
     log(f"📋  Building brief from description: \"{description}\"")
     brief = creator.build_brief_from_description(description)
     log(f"📋  Skill name resolved to: **{brief['skill_name']}**")
-    return creator.run_full_pipeline(brief, interactive=False, log=log)
+    result = creator.run_full_pipeline(brief, interactive=False, log=log)
+    result["token_usage"] = get_create_token_usage()   # attach totals to result
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════

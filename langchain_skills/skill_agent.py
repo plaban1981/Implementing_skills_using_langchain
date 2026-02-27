@@ -125,6 +125,7 @@ class AgentState(TypedDict):
     skill_instructions: Optional[str]
     tool_results:       List[dict]
     final_response:     Optional[str]
+    token_usage:        Dict  # cumulative {input, output, total} across all LLM calls
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -263,7 +264,29 @@ def web_page_scraper_tool(input_value: str) -> str:
         if str(scripts_dir) in sys.path:
             sys.path.remove(str(scripts_dir))
 
+
+
+@tool
+def business_url_hybrid_search_tool(input_value: str) -> str:
+    """Locates official business websites using company name and address via hybrid search APIs."""
+    import sys
+    import json
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).parent / "skills" / "business-url-hybrid-search" / "scripts"
+    sys.path.insert(0, str(scripts_dir))
+    try:
+        import business_url_hybrid_search
+        result = business_url_hybrid_search.run_business_url_hybrid_search(input_value)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e), "error_type": type(e).__name__})
+    finally:
+        if str(scripts_dir) in sys.path:
+            sys.path.remove(str(scripts_dir))
+
 TOOLS_LIST = [
+    business_url_hybrid_search_tool,
     web_page_scraper_tool,
     extract_youtube_transcript,
     extract_youtube_transcript_with_timestamps,
@@ -369,6 +392,37 @@ def _is_list_skills_query(query: str) -> bool:
 # LANGGRAPH NODES
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _extract_token_usage(response) -> Dict:
+    """Pull input/output/total token counts from a Gemini LangChain response."""
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    # langchain-google-genai stores usage in response_metadata
+    meta = getattr(response, "response_metadata", {}) or {}
+    # Gemini SDK key names
+    usage_meta = meta.get("usage_metadata") or meta.get("token_counts") or {}
+    if usage_meta:
+        usage["input_tokens"]  = usage_meta.get("prompt_token_count")     or usage_meta.get("input_tokens",  0)
+        usage["output_tokens"] = usage_meta.get("candidates_token_count") or usage_meta.get("output_tokens", 0)
+        usage["total_tokens"]  = usage_meta.get("total_token_count")       or usage_meta.get("total_tokens",  0)
+    # Fallback: langchain standard usage_metadata attribute
+    if usage["total_tokens"] == 0 and hasattr(response, "usage_metadata"):
+        um = response.usage_metadata or {}
+        usage["input_tokens"]  = um.get("input_tokens",  0)
+        usage["output_tokens"] = um.get("output_tokens", 0)
+        usage["total_tokens"]  = um.get("total_tokens",  0)
+    if usage["total_tokens"] == 0:
+        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    return usage
+
+
+def _merge_usage(a: Dict, b: Dict) -> Dict:
+    """Add two token-usage dicts together."""
+    return {
+        "input_tokens":  a.get("input_tokens",  0) + b.get("input_tokens",  0),
+        "output_tokens": a.get("output_tokens", 0) + b.get("output_tokens", 0),
+        "total_tokens":  a.get("total_tokens",  0) + b.get("total_tokens",  0),
+    }
+
+
 def _agent_node(state: AgentState, registry: Optional[Dict] = None) -> AgentState:
     """Main reasoning node — LLM decides what tool to call next (or ends)."""
     llm      = _get_llm()
@@ -381,12 +435,17 @@ def _agent_node(state: AgentState, registry: Optional[Dict] = None) -> AgentStat
             if tc["name"] == "read_skill_instructions":
                 selected_skill = tc["args"].get("skill_name", selected_skill)
 
+    # Accumulate token usage across all agent turns
+    this_usage = _extract_token_usage(response)
+    cumulative = _merge_usage(state.get("token_usage") or {}, this_usage)
+
     return {
         "messages":           [response],
         "selected_skill":     selected_skill,
         "skill_instructions": state.get("skill_instructions"),
         "tool_results":       state.get("tool_results", []),
         "final_response":     state.get("final_response"),
+        "token_usage":        cumulative,
     }
 
 
@@ -436,6 +495,7 @@ def _tool_node(state: AgentState) -> AgentState:
         "skill_instructions": skill_instructions,
         "tool_results":       tool_results,
         "final_response":     state.get("final_response"),
+        "token_usage":        state.get("token_usage") or {},
     }
 
 
@@ -521,6 +581,7 @@ def run_agent(
         "skill_instructions": None,
         "tool_results":       [],
         "final_response":     None,
+        "token_usage":        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
 
     final_state = compiled.invoke(initial_state, config={"recursion_limit": 25})
@@ -541,6 +602,7 @@ def run_agent(
         "response":       response_text,
         "selected_skill": final_state.get("selected_skill"),
         "tools_called":   tools_used,
+        "token_usage":    final_state.get("token_usage") or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
 
 
