@@ -1,5 +1,3 @@
-# Implementing_skills_using_langchain
-Implementing_skills_using_langchain
 # LangChain Skills Agent
 ### A LangGraph + Gemini 2.0 Flash Replica of Claude's Skill Execution Pipeline
 ### Now with integrated Skill Creation, Hot-Reload, and a 3-Tab Streamlit UI
