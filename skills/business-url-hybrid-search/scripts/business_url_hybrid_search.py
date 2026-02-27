@@ -1,217 +1,289 @@
+"""
+business_url_hybrid_search.py
+
+Finds the official website URL for a business given its name + address.
+
+Search strategy (in priority order):
+  1. SerpAPI Knowledge Graph  — highest confidence, Google-verified
+  2. SerpAPI Organic results  — top organic hits filtered for official domains
+  3. DataForSEO Organic       — cross-reference if credentials available
+  4. Fallback: return all candidates with low-confidence flag
+
+All errors are surfaced in the return dict instead of being silently swallowed,
+so the caller can distinguish "no results" from "API key missing / invalid".
+
+Required env vars (set via Streamlit sidebar):
+  SERPAPI_API_KEY          — https://serpapi.com/manage-api-key  (required)
+  DATAFORSEO_LOGIN         — https://app.dataforseo.com/         (optional)
+  DATAFORSEO_PASSWORD      — same account                        (optional)
+"""
+
 import os
 import json
 import requests
 from urllib.parse import urlparse
-from serpapi import GoogleSearch
 
-# List of common directory/social domains to exclude when looking for an official business URL
+# ── Directory / social domains that are never an official business website ───
 EXCLUDED_DOMAINS = {
-    'yelp.com', 'yellowpages.com', 'facebook.com', 'instagram.com', 
-    'twitter.com', 'linkedin.com', 'tripadvisor.com', 'mapquest.com', 
-    'foursquare.com', 'bbb.org', 'groupon.com', 'angieslist.com', 
-    'thumbtack.com', 'whitepages.com', 'superpages.com', 'booking.com',
-    'expedia.com', 'hotels.com', 'opentable.com', 'zomato.com',
-    'ubereats.com', 'doordash.com', 'grubhub.com', 'pinterest.com',
-    'youtube.com', 'tiktok.com', 'wikipedia.org'
+    "yelp.com", "yellowpages.com", "facebook.com", "instagram.com",
+    "twitter.com", "x.com", "linkedin.com", "tripadvisor.com",
+    "mapquest.com", "foursquare.com", "bbb.org", "groupon.com",
+    "angieslist.com", "thumbtack.com", "whitepages.com", "superpages.com",
+    "booking.com", "expedia.com", "hotels.com", "opentable.com",
+    "zomato.com", "ubereats.com", "doordash.com", "grubhub.com",
+    "pinterest.com", "youtube.com", "tiktok.com", "wikipedia.org",
+    "google.com", "maps.google.com", "apple.com", "bing.com",
 }
 
-def is_valid_official_url(url: str) -> bool:
-    """
-    Checks if a URL is likely an official business site rather than a directory listing.
-    """
+
+def _root_domain(url: str) -> str:
+    """Return bare domain without www. prefix."""
+    try:
+        d = urlparse(url).netloc.lower()
+        return d[4:] if d.startswith("www.") else d
+    except Exception:
+        return ""
+
+
+def is_official_url(url: str) -> bool:
+    """Return True if the URL looks like a direct business website."""
     if not url:
         return False
-    try:
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower()
-        # Remove 'www.' for checking
-        if domain.startswith('www.'):
-            domain = domain[4:]
-        
-        # Check against excluded domains
-        for excluded in EXCLUDED_DOMAINS:
-            if domain == excluded or domain.endswith('.' + excluded):
-                return False
-        return True
-    except Exception:
+    d = _root_domain(url)
+    if not d:
         return False
+    return not any(d == ex or d.endswith("." + ex) for ex in EXCLUDED_DOMAINS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SerpAPI
+# ─────────────────────────────────────────────────────────────────────────────
 
 def search_serpapi(query: str, api_key: str) -> dict:
     """
-    Queries SerpAPI for the business.
-    Returns a dict with 'knowledge_graph_url' and 'organic_urls'.
+    Query SerpAPI Google Search.
+    Returns {"knowledge_graph_url": str|None, "organic_urls": [...], "error": str|None}
     """
-    results = {
-        "knowledge_graph_url": None,
-        "organic_urls": []
-    }
-    
+    result = {"knowledge_graph_url": None, "organic_urls": [], "error": None}
+
     if not api_key:
-        return results
+        result["error"] = "SERPAPI_API_KEY is not set"
+        return result
 
     try:
-        params = {
-            "engine": "google",
-            "q": query,
-            "api_key": api_key,
-            "num": 5  # We only need top results
-        }
-        search = GoogleSearch(params)
-        data = search.get_dict()
+        # Use requests directly — avoids serpapi SDK versioning issues
+        resp = requests.get(
+            "https://serpapi.com/search",
+            params={
+                "engine": "google",
+                "q": query,
+                "api_key": api_key,
+                "num": 10,
+            },
+            timeout=15,
+        )
 
-        # 1. Check Knowledge Graph (High Confidence)
-        if "knowledge_graph" in data:
-            kg = data["knowledge_graph"]
-            if "website" in kg:
-                results["knowledge_graph_url"] = kg["website"]
+        if resp.status_code == 401:
+            result["error"] = "SerpAPI: Invalid or expired API key (401)"
+            return result
+        if resp.status_code == 429:
+            result["error"] = "SerpAPI: Rate limit exceeded (429)"
+            return result
+        if resp.status_code != 200:
+            result["error"] = f"SerpAPI: HTTP {resp.status_code} — {resp.text[:200]}"
+            return result
 
-        # 2. Check Organic Results
-        if "organic_results" in data:
-            for result in data["organic_results"]:
-                link = result.get("link")
-                if link:
-                    results["organic_urls"].append(link)
+        data = resp.json()
 
+        # Knowledge Graph (highest confidence)
+        kg = data.get("knowledge_graph", {})
+        kg_url = kg.get("website") or kg.get("url")
+        if kg_url:
+            result["knowledge_graph_url"] = kg_url
+
+        # Organic results
+        for item in data.get("organic_results", []):
+            link = item.get("link")
+            if link:
+                result["organic_urls"].append(link)
+
+    except requests.exceptions.Timeout:
+        result["error"] = "SerpAPI: Request timed out"
     except Exception as e:
-        print(f"SerpAPI Error: {e}")
+        result["error"] = f"SerpAPI: {type(e).__name__}: {e}"
 
-    return results
+    return result
 
-def search_dataforseo(query: str, login: str, password: str) -> list:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DataForSEO  (optional — gracefully skipped if credentials missing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def search_dataforseo(query: str, login: str, password: str) -> dict:
     """
-    Queries DataForSEO (Google Organic Live) for the business.
-    Returns a list of organic URLs.
+    Query DataForSEO Google Organic Live API.
+    Returns {"organic_urls": [...], "error": str|None}
     """
-    organic_urls = []
-    
+    result = {"organic_urls": [], "error": None}
+
     if not login or not password:
-        return organic_urls
+        result["error"] = "DataForSEO credentials not set (optional — skipped)"
+        return result
 
     try:
-        url = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced"
-        payload = [{
-            "language_code": "en",
-            "location_code": 2840, # United States (Broad default)
-            "keyword": query
-        }]
-        headers = {
-            'content-type': 'application/json'
-        }
+        resp = requests.post(
+            "https://api.dataforseo.com/v3/serp/google/organic/live/advanced",
+            auth=(login, password),
+            json=[{"language_code": "en", "location_code": 2840, "keyword": query}],
+            headers={"content-type": "application/json"},
+            timeout=20,
+        )
 
-        response = requests.post(url, auth=(login, password), data=json.dumps(payload), headers=headers)
-        
-        if response.status_code == 200:
-            res_json = response.json()
-            tasks = res_json.get('tasks', [])
-            if tasks and len(tasks) > 0:
-                result_items = tasks[0].get('result', [])
-                if result_items and len(result_items) > 0:
-                    items = result_items[0].get('items', [])
-                    for item in items:
-                        if item.get('type') == 'organic':
-                            link = item.get('url')
-                            if link:
-                                organic_urls.append(link)
+        if resp.status_code == 401:
+            result["error"] = "DataForSEO: Invalid credentials (401)"
+            return result
+        if resp.status_code != 200:
+            result["error"] = f"DataForSEO: HTTP {resp.status_code}"
+            return result
+
+        data = resp.json()
+        tasks = data.get("tasks", [])
+        if tasks:
+            for item in (tasks[0].get("result") or [{}])[0].get("items", []):
+                if item.get("type") == "organic":
+                    link = item.get("url")
+                    if link:
+                        result["organic_urls"].append(link)
+
+    except requests.exceptions.Timeout:
+        result["error"] = "DataForSEO: Request timed out"
     except Exception as e:
-        print(f"DataForSEO Error: {e}")
+        result["error"] = f"DataForSEO: {type(e).__name__}: {e}"
 
-    return organic_urls
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_business_url_hybrid_search(input_value: str) -> dict:
     """
-    Performs a hybrid search using SerpAPI and DataForSEO to find a business's official URL.
-    
+    Find the official website for a business.
+
     Args:
-        input_value (str): A string containing "Business Name and Address".
-        
+        input_value: "Business Name, Full Address"
+                     e.g. "Allstate, 2775 Sanders Rd, Northbrook IL 60062"
     Returns:
-        dict: {
-            "success": bool,
-            "business_url": str or None,
-            "source": str (e.g., "knowledge_graph", "organic_cross_reference", etc.),
-            "candidates_checked": list
+        {
+          "success":           bool,
+          "business_url":      str | None,
+          "confidence":        "high" | "medium" | "low" | None,
+          "source":            str,
+          "candidates_checked": [str, ...],
+          "errors":            {serpapi: str|None, dataforseo: str|None},
+          "error":             str | None   # top-level summary if complete failure
         }
     """
-    
-    # Configuration
-    serpapi_key = os.getenv("SERPAPI_API_KEY")
-    dfs_login = os.getenv("DATAFORSEO_LOGIN")
-    dfs_password = os.getenv("DATAFORSEO_PASSWORD")
+    serpapi_key   = os.environ.get("SERPAPI_API_KEY", "")
+    dfs_login     = os.environ.get("DATAFORSEO_LOGIN", "")
+    dfs_password  = os.environ.get("DATAFORSEO_PASSWORD", "")
 
-    if not input_value:
-        return {"success": False, "error": "Input value is empty"}
+    if not input_value or not input_value.strip():
+        return {"success": False, "error": "No input provided", "business_url": None}
 
-    # Construct query
-    # We append "official website" to help guide the search engine towards the main domain
-    search_query = f"{input_value} official website"
+    if not serpapi_key:
+        return {
+            "success": False,
+            "business_url": None,
+            "error": "SERPAPI_API_KEY is not set. Please add it in the sidebar under 🔑 Skill API Keys.",
+            "errors": {"serpapi": "API key missing", "dataforseo": None},
+        }
 
-    # 1. Execute Searches
-    serp_results = search_serpapi(search_query, serpapi_key)
-    dfs_urls = search_dataforseo(search_query, dfs_login, dfs_password)
+    query = f"{input_value.strip()} official website"
 
-    # 2. Analyze Results
-    
-    # Priority A: Knowledge Graph Website (Highest Confidence)
-    # Google's Knowledge Graph usually links directly to the verified business owner.
-    if serp_results.get("knowledge_graph_url"):
-        kg_url = serp_results["knowledge_graph_url"]
-        if is_valid_official_url(kg_url):
-            return {
-                "success": True,
-                "business_url": kg_url,
-                "source": "serpapi_knowledge_graph",
-                "candidates_checked": [kg_url]
-            }
+    # ── Run searches ──────────────────────────────────────────────────────────
+    serp   = search_serpapi(query, serpapi_key)
+    dfs    = search_dataforseo(query, dfs_login, dfs_password)
 
-    # Priority B: Cross-Referencing Organic Results
-    # Combine lists, prioritizing SerpAPI organic then DataForSEO organic
-    combined_candidates = []
-    
-    # Interleave results to give fair weight if both exist, or just extend
-    # Here we prioritize SerpAPI organic first, then DataForSEO
-    combined_candidates.extend(serp_results.get("organic_urls", []))
-    combined_candidates.extend(dfs_urls)
+    errors = {
+        "serpapi":    serp.get("error"),
+        "dataforseo": dfs.get("error"),
+    }
 
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_candidates = []
-    for url in combined_candidates:
+    # ── Priority 1: Knowledge Graph ───────────────────────────────────────────
+    kg_url = serp.get("knowledge_graph_url")
+    if kg_url and is_official_url(kg_url):
+        return {
+            "success": True,
+            "business_url": kg_url,
+            "confidence": "high",
+            "source": "serpapi_knowledge_graph",
+            "candidates_checked": [kg_url],
+            "errors": errors,
+        }
+
+    # ── Priority 2: Cross-reference organic results ───────────────────────────
+    all_candidates = serp.get("organic_urls", []) + dfs.get("organic_urls", [])
+
+    # Deduplicate preserving order
+    seen: set = set()
+    unique: list = []
+    for url in all_candidates:
         if url not in seen:
-            unique_candidates.append(url)
+            unique.append(url)
             seen.add(url)
 
-    # Filter candidates
-    for url in unique_candidates:
-        if is_valid_official_url(url):
-            return {
-                "success": True,
-                "business_url": url,
-                "source": "hybrid_organic_search",
-                "candidates_checked": unique_candidates[:5] # Return top 5 checked for context
-            }
+    official = [u for u in unique if is_official_url(u)]
 
-    # Priority C: Fallback
-    # If no "valid" official URL found (e.g., only Facebook pages found), 
-    # we might return the top result if it exists, but mark success as False or low confidence.
-    # For this strict implementation, we return failure if no non-directory site is found.
-    
+    if official:
+        # High confidence if same domain appears in both sources
+        serp_domains = {_root_domain(u) for u in serp.get("organic_urls", [])}
+        dfs_domains  = {_root_domain(u) for u in dfs.get("organic_urls", [])}
+        top_domain   = _root_domain(official[0])
+        confidence   = "high" if (top_domain in serp_domains and top_domain in dfs_domains) else "medium"
+
+        return {
+            "success": True,
+            "business_url": official[0],
+            "confidence": confidence,
+            "source": "hybrid_organic" if dfs.get("organic_urls") else "serpapi_organic",
+            "candidates_checked": unique[:10],
+            "errors": errors,
+        }
+
+    # ── Priority 3: Return all candidates even if all are directories ─────────
+    if unique:
+        return {
+            "success": False,
+            "business_url": None,
+            "confidence": "low",
+            "source": "no_official_found",
+            "candidates_checked": unique[:10],
+            "errors": errors,
+            "error": (
+                "Only directory/social sites found. "
+                "The business may not have its own website. "
+                f"Top candidates: {', '.join(unique[:3])}"
+            ),
+        }
+
+    # ── Complete failure ──────────────────────────────────────────────────────
+    serp_err = errors.get("serpapi") or "no results returned"
     return {
         "success": False,
         "business_url": None,
-        "error": "No official website found among top results.",
-        "candidates_checked": unique_candidates[:5]
+        "confidence": None,
+        "source": "no_results",
+        "candidates_checked": [],
+        "errors": errors,
+        "error": f"No results from any source. SerpAPI status: {serp_err}",
     }
+
 
 if __name__ == "__main__":
     import sys
-    
-    # Simple CLI entry point
-    if len(sys.argv) > 1:
-        input_str = sys.argv[1]
-    else:
-        # Default test case if no args provided
-        input_str = "The French Laundry 6640 Washington St, Yountville, CA"
-        print(f"No input provided. Using test case: {input_str}")
-
-    result = run_business_url_hybrid_search(input_str)
-    print(json.dumps(result, indent=2))
+    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Allstate Northbrook IL"
+    print(f"Searching for: {query}\n")
+    out = run_business_url_hybrid_search(query)
+    print(json.dumps(out, indent=2))

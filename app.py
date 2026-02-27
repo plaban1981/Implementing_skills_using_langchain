@@ -1,20 +1,5 @@
 """
-app.py — LangChain Skills Agent with Token Usage tracking.
-
-ROOT CAUSE FIX for sidebar tokens showing 0:
-  Streamlit forms submit and run the script top-to-bottom. The sidebar is
-  rendered BEFORE the `if submitted:` block runs and calls _record_tokens().
-  Even with live-recompute from token_history, the list is still empty at
-  sidebar render time for the SAME script pass.
-
-  Fix: after _record_tokens() appends to token_history, we call st.rerun()
-  which re-executes the entire script — NOW the sidebar renders AFTER the
-  data is in session_state, so it shows the correct values.
-
-  For skill creation: we use a _pending_rerun flag set at the END of the
-  `if submitted:` block (after the spinner completes), checked at the very
-  TOP of the script body so it fires on the next script pass before anything
-  is rendered.
+app.py — LangChain Skills Agent with Token Usage + Dynamic Skill API Keys
 """
 
 import os
@@ -22,7 +7,7 @@ import sys
 import importlib
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import streamlit as st
 
@@ -37,22 +22,42 @@ st.set_page_config(
 from skills_registry import get_registry
 from skill_agent     import run_agent, reload_tools
 from create_skill    import create_skill_programmatic
-from skill_api_keys  import get_keys_for_skill, get_missing_keys, all_required_keys_present
+from skill_api_keys  import get_keys_for_skill, get_missing_keys
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EARLY RERUN CHECK — must be FIRST thing after imports, before any rendering
+# SESSION STATE  — initialise everything before any rendering
 # ══════════════════════════════════════════════════════════════════════════════
-# This fires on the pass AFTER skill creation or chat completes.
-# At this point token_history already has the new entry, so sidebar will
-# read the correct non-zero values.
 
-def _check_pending_rerun():
-    if st.session_state.get("_pending_rerun"):
-        st.session_state["_pending_rerun"] = False
-        st.rerun()
+_DEFAULTS = {
+    "chat_messages":      [],
+    "last_created_skill": None,
+    "creation_result":    None,
+    "token_history":      [],
+    "_pending_rerun":     False,
+    # Stores skill API key values entered by the user so they survive reruns
+    "skill_keys":         {},    # { "SERPAPI_API_KEY": "value", ... }
+}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
-# We call this after session state is initialised (a few lines below).
+
+def _apply_skill_keys():
+    """Push all user-entered skill keys from session_state into os.environ."""
+    for env_var, val in st.session_state["skill_keys"].items():
+        if val:
+            os.environ[env_var] = val
+
+
+# Apply on every script run so os.environ is always up-to-date
+_apply_skill_keys()
+
+
+# ── Pending rerun (must fire BEFORE any rendering) ───────────────────────────
+if st.session_state.get("_pending_rerun"):
+    st.session_state["_pending_rerun"] = False
+    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -64,19 +69,7 @@ _EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 def _safe_usage(u) -> Dict:
     if not isinstance(u, dict):
         return dict(_EMPTY_USAGE)
-    return {
-        "input_tokens":  int(u.get("input_tokens",  0) or 0),
-        "output_tokens": int(u.get("output_tokens", 0) or 0),
-        "total_tokens":  int(u.get("total_tokens",  0) or 0),
-    }
-
-def _add_usage(a: Dict, b: Dict) -> Dict:
-    a, b = _safe_usage(a), _safe_usage(b)
-    return {
-        "input_tokens":  a["input_tokens"]  + b["input_tokens"],
-        "output_tokens": a["output_tokens"] + b["output_tokens"],
-        "total_tokens":  a["total_tokens"]  + b["total_tokens"],
-    }
+    return {k: int(u.get(k, 0) or 0) for k in _EMPTY_USAGE}
 
 def _fmt(n: int) -> str:
     return f"{n:,}"
@@ -91,28 +84,7 @@ def _token_badge(usage: Dict):
         f"**Σ {_fmt(u['total_tokens'])}**"
     )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SESSION STATE
-# ══════════════════════════════════════════════════════════════════════════════
-
-_DEFAULTS = {
-    "chat_messages":      [],
-    "last_created_skill": None,
-    "creation_result":    None,
-    "token_history":      [],       # list of {ts, activity, label, input, output, total}
-    "_pending_rerun":     False,
-}
-for _k, _v in _DEFAULTS.items():
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
-
-# NOW fire the pending rerun (session state is ready)
-_check_pending_rerun()
-
-
 def _record_tokens(activity: str, label: str, usage: Dict):
-    """Append to token_history. Set _pending_rerun so sidebar updates next pass."""
     u = _safe_usage(usage)
     if u["total_tokens"] == 0:
         return
@@ -124,50 +96,117 @@ def _record_tokens(activity: str, label: str, usage: Dict):
         "output":   u["output_tokens"],
         "total":    u["total_tokens"],
     })
-    # Signal that the next script pass should fire st.rerun()
-    # so the sidebar (rendered at top) picks up the new data.
     st.session_state["_pending_rerun"] = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR — computes totals directly from token_history at render time
+# SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.title("⚙️ Configuration")
 
-    api_key = st.text_input(
-        "Google API Key",
+    # ── 1. Google / Gemini API key ────────────────────────────────────────────
+    st.title("⚙️ Configuration")
+    _gemini_val = st.text_input(
+        "🤖 Google (Gemini) API Key *",
         value=os.environ.get("GOOGLE_API_KEY", ""),
         type="password",
-        help="https://aistudio.google.com/",
+        help="Required for all LLM calls — https://aistudio.google.com/",
+        key="gemini_api_key_input",
     )
-    if api_key:
-        os.environ["GOOGLE_API_KEY"] = api_key
+    if _gemini_val:
+        os.environ["GOOGLE_API_KEY"] = _gemini_val
 
+    # ── 2. Skill-specific API keys ────────────────────────────────────────────
+    _reg = get_registry()
+    _skills_with_keys = {
+        name: get_keys_for_skill(name)
+        for name in _reg
+        if get_keys_for_skill(name)
+    }
+
+    if _skills_with_keys:
+        st.divider()
+        st.subheader("🔑 Skill API Keys")
+        st.caption("Stored in session memory only — never written to disk.")
+
+        for _skill_name, _specs in _skills_with_keys.items():
+
+            # Pre-seed widget session-state keys on very first render
+            # (Streamlit ignores value= after first render, so we must seed via
+            # session_state BEFORE the widget is rendered)
+            for _spec in _specs:
+                _wk = f"sk_{_spec['env_var']}"   # widget key
+                if _wk not in st.session_state:
+                    # initialise from os.environ if already set (e.g. from .env file)
+                    st.session_state[_wk] = os.environ.get(_spec["env_var"], "")
+
+            # Sync widget values → os.environ on every render pass
+            for _spec in _specs:
+                _wk  = f"sk_{_spec['env_var']}"
+                _val = st.session_state.get(_wk, "")
+                if _val:
+                    os.environ[_spec["env_var"]] = _val
+                elif _spec["env_var"] in os.environ:
+                    del os.environ[_spec["env_var"]]
+
+            # Status badge
+            _n_required = sum(1 for s in _specs if s["required"])
+            _n_filled   = sum(
+                1 for s in _specs
+                if s["required"] and st.session_state.get(f"sk_{s['env_var']}", "").strip()
+            )
+            _all_ok = (_n_filled >= _n_required)
+            _icon   = "✅" if _all_ok else "⚠️"
+
+            with st.expander(f"{_icon} {_skill_name}", expanded=not _all_ok):
+                if _all_ok:
+                    st.success("All required keys are set.", icon="✅")
+                else:
+                    st.warning(
+                        f"{_n_required - _n_filled} required key(s) missing — "
+                        "paste them below to enable this skill.",
+                        icon="⚠️",
+                    )
+
+                for _spec in _specs:
+                    _env    = _spec["env_var"]
+                    _label  = _spec["label"]
+                    _help   = _spec["help"]
+                    _req    = _spec["required"]
+                    _ispass = _spec["is_password"]
+                    _badge  = " *" if _req else " (optional)"
+
+                    # key=f"sk_{_env}" means Streamlit stores the live value at
+                    # st.session_state["sk_SERPAPI_API_KEY"] etc. automatically.
+                    # We pre-seeded it above, so it always reflects current state.
+                    st.text_input(
+                        f"{_label}{_badge}",
+                        type="password" if _ispass else "default",
+                        help=_help,
+                        key=f"sk_{_env}",
+                        placeholder="Paste key here…",
+                    )
+
+    # ── 3. Session tokens ─────────────────────────────────────────────────────
     st.divider()
-
-    # Live-compute from token_history so it's always accurate
     st.subheader("🔢 Session Tokens")
     _hist = st.session_state["token_history"]
     _tt   = sum(r["total"]  for r in _hist)
     _ti   = sum(r["input"]  for r in _hist)
     _to   = sum(r["output"] for r in _hist)
     _nc   = len(_hist)
-
     sb1, sb2 = st.columns(2)
     sb1.metric("Total",    _fmt(_tt))
     sb2.metric("In / Out", f"{_fmt(_ti)} / {_fmt(_to)}")
     st.caption(f"{_nc} LLM call{'s' if _nc != 1 else ''} this session")
-
     if st.button("🗑️ Reset tokens", use_container_width=True):
         st.session_state["token_history"] = []
         st.rerun()
 
+    # ── 4. Loaded skills ──────────────────────────────────────────────────────
     st.divider()
-
     st.subheader("📦 Loaded Skills")
-    _reg = get_registry()
     if _reg:
         for _name, _skill in _reg.items():
             _badge = "🆕 " if _name == st.session_state.get("last_created_skill") else "🔧 "
@@ -176,55 +215,8 @@ with st.sidebar:
     else:
         st.warning("No skills loaded.")
     st.caption(f"**{len(_reg)}** skill(s) loaded")
-
     if st.button("🔄 Refresh"):
         st.rerun()
-
-    # ── Dynamic API keys for loaded skills ──────────────────────────────
-    # For every loaded skill that has registered API key requirements,
-    # render input fields so the user can supply them without editing .env.
-    _skills_needing_keys = {
-        name: get_keys_for_skill(name)
-        for name in _reg
-        if get_keys_for_skill(name)
-    }
-
-    if _skills_needing_keys:
-        st.divider()
-        st.subheader("🔑 Skill API Keys")
-        st.caption("Keys are stored in memory for this session only.")
-
-        for _skill_name, _key_specs in _skills_needing_keys.items():
-            _missing = get_missing_keys(_skill_name)
-            _all_ok  = len(_missing) == 0
-
-            _status_icon = "✅" if _all_ok else "⚠️"
-            with st.expander(
-                f"{_status_icon} {_skill_name}",
-                expanded=not _all_ok,   # auto-open when keys are missing
-            ):
-                if _all_ok:
-                    st.success("All required keys are set.", icon="✅")
-
-                for _spec in _key_specs:
-                    _env      = _spec["env_var"]
-                    _label    = _spec["label"]
-                    _help     = _spec["help"]
-                    _req      = _spec["required"]
-                    _is_pass  = _spec["is_password"]
-                    _current  = os.environ.get(_env, "")
-                    _badge    = " *" if _req else " (optional)"
-
-                    _val = st.text_input(
-                        f"{_label}{_badge}",
-                        value=_current,
-                        type="password" if _is_pass else "default",
-                        help=_help,
-                        key=f"sk_{_env}",
-                    )
-                    if _val and _val != _current:
-                        os.environ[_env] = _val
-                        st.success(f"✓ {_env} saved for this session", icon="✅")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -242,6 +234,28 @@ tab_chat, tab_create, tab_library, tab_tokens = st.tabs([
 
 with tab_chat:
     st.header("💬 Skill-Aware Chat")
+
+    # ── Missing-key warning banner ────────────────────────────────────────────
+    _reg_now = get_registry()
+    _blocked = []
+    for _sname in _reg_now:
+        _specs = get_keys_for_skill(_sname)
+        for _sp in _specs:
+            if _sp["required"]:
+                _v = (
+                    st.session_state["skill_keys"].get(_sp["env_var"])
+                    or os.environ.get(_sp["env_var"], "")
+                )
+                if not _v:
+                    _blocked.append(_sname)
+                    break
+    if _blocked:
+        st.warning(
+            f"🔑 **Missing API keys** for: {', '.join(f'`{n}`' for n in _blocked)}. "
+            "Add them in the sidebar under **🔑 Skill API Keys** — "
+            "the expander auto-opens when keys are missing.",
+            icon="⚠️",
+        )
 
     with st.expander("ℹ️ How it works"):
         st.markdown("""
@@ -270,25 +284,9 @@ with tab_chat:
             st.markdown(msg["content"])
             if msg["role"] == "assistant":
                 ic = st.columns([2, 2, 4])
-                if msg.get("skill"):
-                    ic[0].caption(f"🔧 `{msg['skill']}`")
-                if msg.get("tools"):
-                    ic[1].caption(f"🛠️ `{', '.join(msg['tools'])}`")
+                if msg.get("skill"):  ic[0].caption(f"🔧 `{msg['skill']}`")
+                if msg.get("tools"):  ic[1].caption(f"🛠️ `{', '.join(msg['tools'])}`")
                 _token_badge(msg.get("token_usage", {}))
-
-    # Warn if any loaded skill is missing required keys
-    _skills_with_missing = [
-        name for name in get_registry()
-        if get_missing_keys(name)
-    ]
-    if _skills_with_missing:
-        _missing_names = ", ".join(f"`{n}`" for n in _skills_with_missing)
-        st.warning(
-            f"🔑 **Missing API keys** for: {_missing_names}. "
-            "These skills won't work until you add the keys in the sidebar under "
-            "**🔑 Skill API Keys**.",
-            icon="⚠️",
-        )
 
     prefill    = st.session_state.pop("prefill_query", "")
     user_input = st.chat_input("Ask anything...")
@@ -297,7 +295,7 @@ with tab_chat:
 
     if user_input:
         if not os.environ.get("GOOGLE_API_KEY"):
-            st.error("⚠️ Add your Google API Key in the sidebar.")
+            st.error("⚠️ Add your Google (Gemini) API Key in the sidebar first.")
             st.stop()
 
         st.session_state["chat_messages"].append({"role": "user", "content": user_input})
@@ -327,7 +325,6 @@ with tab_chat:
                     if tools_called:   ic[1].caption(f"🛠️ `{', '.join(tools_called)}`")
                     _token_badge(usage)
 
-                    # Save message first, then record tokens (sets _pending_rerun=True)
                     st.session_state["chat_messages"].append({
                         "role": "assistant", "content": response,
                         "skill": selected_skill, "tools": tools_called,
@@ -335,9 +332,6 @@ with tab_chat:
                         "ts": datetime.now().strftime("%H:%M:%S"),
                     })
                     _record_tokens("💬 Chat", user_input[:50], usage)
-                    # st.rerun() fires on the NEXT pass via _check_pending_rerun()
-                    # which is at the top of the script — sidebar will then have
-                    # the correct non-zero values.
                     st.rerun()
 
                 except Exception as e:
@@ -379,8 +373,10 @@ with tab_create:
         )
         c1, c2 = st.columns([1, 3])
         submitted = c1.form_submit_button("🚀 Create", use_container_width=True, type="primary")
-        c2.markdown("<small style='color:grey'>~30–60 s · token usage shown after</small>",
-                    unsafe_allow_html=True)
+        c2.markdown(
+            "<small style='color:grey'>~30–60 s · token usage shown after</small>",
+            unsafe_allow_html=True,
+        )
 
     if submitted:
         if not os.environ.get("GOOGLE_API_KEY"):
@@ -393,8 +389,7 @@ with tab_create:
         st.session_state["creation_result"]    = None
         st.session_state["last_created_skill"] = None
 
-        log_box   = st.empty()
-        log_lines = []
+        log_box, log_lines = st.empty(), []
         def ui_log(msg):
             log_lines.append(msg)
             log_box.markdown("\n\n".join(log_lines))
@@ -404,35 +399,25 @@ with tab_create:
                 result = create_skill_programmatic(skill_desc.strip(), log=ui_log)
                 st.session_state["creation_result"]    = result
                 st.session_state["last_created_skill"] = result["skill_name"]
-
                 usage = _safe_usage(result.get("token_usage", {}))
-                # _record_tokens sets _pending_rerun=True
                 _record_tokens("🛠️ Skill Creation", f"Created: {result['skill_name']}", usage)
-
                 try:
                     reload_tools()
                     ui_log("🔄 Tools reloaded — live in Chat tab.")
                 except Exception as re_err:
-                    ui_log(f"⚠️ Hot-reload failed ({re_err}). Restart to activate @tool.")
-
+                    ui_log(f"⚠️ Hot-reload failed ({re_err}). Restart to activate.")
             except Exception as e:
                 st.error(f"❌ Failed: {e}")
                 st.stop()
 
-        # After the spinner block completes, _pending_rerun is True.
-        # Calling st.rerun() here will re-execute the whole script.
-        # _check_pending_rerun() at the TOP will set it False and call st.rerun()
-        # one more time — but we avoid that double-rerun by calling st.rerun()
-        # directly here instead of setting the flag.
-        # So: clear the flag and rerun now.
         st.session_state["_pending_rerun"] = False
         st.rerun()
 
-    # ── Result display ────────────────────────────────────────────────────────
     result = st.session_state.get("creation_result")
     if result:
         st.success(f"✅ **{result['skill_name']}** created!")
 
+        # ── Token usage panel ─────────────────────────────────────────────────
         usage = _safe_usage(result.get("token_usage", {}))
         st.subheader("🔢 Token Usage — This Creation")
         t1, t2, t3, t4 = st.columns(4)
@@ -451,6 +436,15 @@ with tab_create:
             | 4 | @tool stub | ~15% |
             | 7 | Routing test | ~20% |
             """)
+
+        # ── Skill API keys prompt (if new skill needs them) ───────────────────
+        _new_skill_keys = get_keys_for_skill(result["skill_name"])
+        if _new_skill_keys:
+            st.info(
+                f"🔑 **{result['skill_name']}** requires API keys. "
+                "They are now shown in the sidebar under **🔑 Skill API Keys**.",
+                icon="ℹ️",
+            )
 
         st.divider()
         rc1, rc2 = st.columns(2)
@@ -486,7 +480,7 @@ with tab_library:
     st.header("📦 Skill Library")
     lib_reg = get_registry()
     if not lib_reg:
-        st.warning("No skills yet. Create one in 🛠️.")
+        st.warning("No skills yet.")
     else:
         search = st.text_input("🔍 Filter", placeholder="name or description")
         for name, skill in lib_reg.items():
@@ -494,9 +488,24 @@ with tab_library:
                       and search.lower() not in skill["description"].lower():
                 continue
             badge = "🆕 " if name == st.session_state.get("last_created_skill") else ""
-            with st.expander(f"{badge}🔧 {name}",
-                             expanded=(name == st.session_state.get("last_created_skill"))):
+            with st.expander(
+                f"{badge}🔧 {name}",
+                expanded=(name == st.session_state.get("last_created_skill")),
+            ):
                 st.markdown(f"**{skill['description']}**")
+
+                # Show required API keys for this skill
+                _sk = get_keys_for_skill(name)
+                if _sk:
+                    _req_keys = [s for s in _sk if s["required"]]
+                    _opt_keys = [s for s in _sk if not s["required"]]
+                    _parts = []
+                    if _req_keys:
+                        _parts.append("**Required:** " + ", ".join(f"`{s['env_var']}`" for s in _req_keys))
+                    if _opt_keys:
+                        _parts.append("**Optional:** " + ", ".join(f"`{s['env_var']}`" for s in _opt_keys))
+                    st.caption("🔑 " + "  ·  ".join(_parts))
+
                 lc1, lc2 = st.columns(2)
                 with lc1:
                     md_path = skill.get("skill_md_path")
@@ -521,12 +530,11 @@ with tab_tokens:
     st.header("📊 Token Usage Dashboard")
     st.caption("Model: `gemini-3-pro-preview`")
 
-    hist   = st.session_state["token_history"]
-    tt     = sum(r["total"]  for r in hist)
-    ti     = sum(r["input"]  for r in hist)
-    to_    = sum(r["output"] for r in hist)
+    hist = st.session_state["token_history"]
+    tt   = sum(r["total"]  for r in hist)
+    ti   = sum(r["input"]  for r in hist)
+    to_  = sum(r["output"] for r in hist)
 
-    # Session totals
     st.subheader("🔢 Session Totals")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Tokens",  _fmt(tt))
@@ -536,15 +544,12 @@ with tab_tokens:
 
     st.divider()
 
-    # Per-activity breakdown
     st.subheader("📂 By Activity")
     groups: Dict[str, Dict] = {}
     for row in hist:
         g = groups.setdefault(row["activity"], {"input":0,"output":0,"total":0,"calls":0})
-        g["input"]  += row["input"]
-        g["output"] += row["output"]
-        g["total"]  += row["total"]
-        g["calls"]  += 1
+        g["input"] += row["input"]; g["output"] += row["output"]
+        g["total"] += row["total"]; g["calls"]  += 1
 
     if groups:
         gcols = st.columns(max(len(groups), 1))
@@ -556,11 +561,10 @@ with tab_tokens:
                 st.metric("Output", _fmt(s["output"]))
                 st.caption(f"{s['calls']} call{'s' if s['calls']!=1 else ''}")
     else:
-        st.info("No LLM calls yet. Chat or create a skill to see usage.")
+        st.info("No LLM calls yet.")
 
     st.divider()
 
-    # Call history table
     st.subheader("📋 Call History")
     if hist:
         hdr = st.columns([1, 2, 4, 2, 2, 2])
@@ -577,7 +581,6 @@ with tab_tokens:
             rc[5].metric("t", _fmt(row["total"]),  label_visibility="collapsed")
             st.divider()
 
-        # Bar chart
         st.subheader("📈 Usage Over Time")
         try:
             import pandas as pd
@@ -591,8 +594,6 @@ with tab_tokens:
             st.info("`pip install pandas` for chart.")
 
         st.divider()
-
-        # CSV export
         lines = ["time,activity,label,input_tokens,output_tokens,total_tokens"]
         for r in hist:
             lines.append(
