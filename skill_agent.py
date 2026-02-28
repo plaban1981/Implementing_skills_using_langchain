@@ -341,33 +341,52 @@ def _get_llm():
 # SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_system_prompt(registry: Optional[Dict] = None) -> str:
+def build_system_prompt(registry: Optional[Dict] = None, executed_tools: Optional[List] = None) -> str:
     if registry is None:
         registry = get_registry()
     skills_block = format_skills_for_prompt(registry)
+
+    # Build a "already done" block so Gemini knows not to repeat calls
+    done_block = ""
+    if executed_tools:
+        done_lines = []
+        for tr in executed_tools:
+            done_lines.append(f"  - {tr['tool']}({json.dumps(tr['args'])[:80]}) → DONE")
+        done_block = (
+            "\n## ✅ Tools Already Executed This Turn (DO NOT call again)\n"
+            + "\n".join(done_lines)
+            + "\n\nAll results are already in the conversation above. "
+            "Write your final response NOW based on those results.\n"
+        )
 
     return f"""You are a helpful assistant with access to specialised **Skills**.
 
 ## Handling Requests
 
 1. Check if any skill matches the user's request using the descriptions below.
-2. If a skill matches, call `read_skill_instructions` first, then execute the workflow.
-3. Synthesise all tool results into a clean, well-formatted Markdown response.
+2. If a skill matches, call `read_skill_instructions` ONCE, then call the skill tool ONCE.
+3. After tools return results, write your final Markdown response immediately.
 4. If no skill matches, answer from your own knowledge.
+
+## STRICT Tool Usage Rules
+
+- Call `read_skill_instructions` EXACTLY ONCE per request — never twice.
+- Call each skill tool EXACTLY ONCE — never repeat a tool call.
+- After receiving tool results, STOP calling tools and write your response.
+- Do NOT call `read_skill_instructions` again after you already have the instructions.
+- Do NOT call the same tool twice with the same arguments.
 
 ---
 
 {skills_block}
-
+{done_block}
 ---
 
-## CRITICAL Response Rules
+## Response Format Rules
 
 - **ALWAYS** return clean Markdown text — never raw Python dicts, JSON objects, or repr strings.
 - **NEVER** include `extras`, `signature`, `type`, `id`, or base64 strings in your response.
-- When a tool returns text, present that text directly to the user without modification.
-- When listing skills, use numbered headings and short descriptions — no raw data.
-- Call `read_skill_instructions` BEFORE any skill-specific tool, every time.
+- When a tool returns transcript text, format it clearly for the user.
 - Execute immediately — do not ask for confirmation.
 """
 
@@ -425,8 +444,10 @@ def _merge_usage(a: Dict, b: Dict) -> Dict:
 
 def _agent_node(state: AgentState, registry: Optional[Dict] = None) -> AgentState:
     """Main reasoning node — LLM decides what tool to call next (or ends)."""
-    llm      = _get_llm()
-    messages = [SystemMessage(content=build_system_prompt(registry))] + state["messages"]
+    llm           = _get_llm()
+    executed      = state.get("tool_results", [])   # tools already run this turn
+    system_prompt = build_system_prompt(registry, executed_tools=executed if executed else None)
+    messages      = [SystemMessage(content=system_prompt)] + state["messages"]
     response = llm.invoke(messages)
 
     selected_skill = state.get("selected_skill")
@@ -449,6 +470,11 @@ def _agent_node(state: AgentState, registry: Optional[Dict] = None) -> AgentStat
     }
 
 
+# Tracks (tool_name, args_json) pairs already executed in this run
+# to prevent Gemini from calling the same tool twice.
+_ALREADY_CALLED: set = set()
+
+
 def _tool_node(state: AgentState) -> AgentState:
     """Tool execution node — runs each tool call and returns ToolMessages."""
     last_msg           = state["messages"][-1]
@@ -456,10 +482,32 @@ def _tool_node(state: AgentState) -> AgentState:
     skill_instructions = state.get("skill_instructions")
     new_messages       = []
 
+    # Build a set of (name, args_json) already called this run from tool_results
+    already_called = {
+        (tr["tool"], json.dumps(tr["args"], sort_keys=True))
+        for tr in tool_results
+    }
+
     for tc in last_msg.tool_calls:
         name    = tc["name"]
         args    = tc["args"]
         call_id = tc["id"]
+        call_key = (name, json.dumps(args, sort_keys=True))
+
+        # ── Deduplication: skip if this exact call already ran ──────────────
+        if call_key in already_called:
+            print(f"[Tool] ⏭ SKIPPED duplicate call: {name}({json.dumps(args)[:80]})")
+            # Return the cached result from the previous identical call
+            cached = next(
+                (tr["result_full"] for tr in tool_results
+                 if tr["tool"] == name and
+                 json.dumps(tr["args"], sort_keys=True) == json.dumps(args, sort_keys=True)),
+                json.dumps({"note": f"Already called {name} — using previous result."})
+            )
+            new_messages.append(
+                ToolMessage(content=cached, tool_call_id=call_id, name=name)
+            )
+            continue
 
         print(f"[Tool] → {name}({json.dumps(args)[:120]})")
 
@@ -482,11 +530,13 @@ def _tool_node(state: AgentState) -> AgentState:
         tool_results.append({
             "tool":           name,
             "args":           args,
-            "result_preview": result[:500],
+            "result_preview": result[:500],   # for display
+            "result_full":    result,          # full result for fallback rendering
         })
+        already_called.add(call_key)
 
         new_messages.append(
-            ToolMessage(content=result, tool_call_id=call_id, name=name)
+            ToolMessage(content=cached if False else result, tool_call_id=call_id, name=name)
         )
 
     return {
@@ -584,7 +634,7 @@ def run_agent(
         "token_usage":        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
 
-    final_state = compiled.invoke(initial_state, config={"recursion_limit": 25})
+    final_state = compiled.invoke(initial_state, config={"recursion_limit": 8})
 
     # ── Extract clean text from the final message ─────────────────────────────
     last_msg      = final_state["messages"][-1]
@@ -602,6 +652,7 @@ def run_agent(
         "response":       response_text,
         "selected_skill": final_state.get("selected_skill"),
         "tools_called":   tools_used,
+        "tool_results":   final_state.get("tool_results", []),
         "token_usage":    final_state.get("token_usage") or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
 

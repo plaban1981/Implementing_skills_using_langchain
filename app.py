@@ -306,18 +306,58 @@ with tab_chat:
             with st.spinner("Thinking..."):
                 try:
                     result         = run_agent(user_input, verbose=False, registry=get_registry())
-                    raw            = result["response"]
+                    # run_agent already calls extract_text_content() — use directly
+                    response       = result["response"]  # always a clean str
                     selected_skill = result.get("selected_skill")
                     tools_called   = result.get("tools_called", [])
+                    tool_results   = result.get("tool_results", [])
                     usage          = _safe_usage(result.get("token_usage", {}))
 
-                    response = (
-                        "\n".join(
-                            b.get("text") or b.get("content") or ""
-                            for b in raw if isinstance(b, dict)
-                        ).strip()
-                        if isinstance(raw, list) else str(raw).strip()
-                    )
+                    # ── Fallback: if LLM returned empty response but tools ran, ──
+                    # show the tool output directly so the user always sees content
+                    if not response.strip() and tool_results:
+                        fallback_parts = []
+                        for tr in tool_results:
+                            tool_name = tr.get("tool", "")
+                            # skip internal routing tools
+                            if tool_name in ("read_skill_instructions", "list_available_skills"):
+                                continue
+                            preview = tr.get("result_full") or tr.get("result_preview", "")
+                            if not preview:
+                                continue
+                            # try to parse JSON result and extract the best field
+                            try:
+                                import json as _json
+                                data = _json.loads(preview)
+                                if isinstance(data, dict):
+                                    # prefer transcript > formatted_with_timestamps > result > summary
+                                    for key in ("transcript", "formatted_with_timestamps",
+                                                "summary", "result", "text", "content"):
+                                        if data.get(key):
+                                            fallback_parts.append(
+                                                f"### 📄 {tool_name.replace('_', ' ').title()}\n\n"
+                                                f"{data[key]}"
+                                            )
+                                            break
+                                    else:
+                                        # no known key — show the whole JSON neatly
+                                        fallback_parts.append(
+                                            f"### 📄 {tool_name.replace('_', ' ').title()}\n\n"
+                                            f"```json\n{preview}\n```"
+                                        )
+                            except Exception:
+                                fallback_parts.append(
+                                    f"### 📄 {tool_name.replace('_', ' ').title()}\n\n{preview}"
+                                )
+
+                        if fallback_parts:
+                            response = (
+                                "⚠️ *The model returned an empty synthesis — "
+                                "showing raw tool output below.*\n\n---\n\n"
+                                + "\n\n---\n\n".join(fallback_parts)
+                            )
+                        else:
+                            response = "⚠️ The agent ran but returned no content. Please try again."
 
                     st.markdown(response)
                     ic = st.columns([2, 2, 4])
