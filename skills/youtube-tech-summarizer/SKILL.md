@@ -1,53 +1,62 @@
 ---
 name: youtube-tech-summarizer
-description: Automatically generate comprehensive step-by-step guides and blog posts from technical YouTube videos. Use when users share YouTube links requesting summaries, guides, explanations, or content about programming tutorials, AI/ML, software development, frameworks, or technology demonstrations. Automatically extracts transcripts, analyzes content, shows original code followed by enhanced versions, and creates adaptive 2000-6000 word guides.
+description: Generate a comprehensive guide, summary, or blog post FROM a YouTube video.
+             Trigger when the user shares a YouTube URL and asks for:
+             summarize, summary, explain, guide, blog post, write a post about, break down,
+             key points, notes, what does this video cover, tech tutorial, step-by-step guide.
+             Supports 4 output styles: guide (default), blog, summary, bullets.
+             DO NOT use this for plain transcript extraction — use youtube-transcript for that.
 ---
 
 # YouTube Technical Video Summarizer
 
-Automatically transform technical YouTube videos into comprehensive, publication-ready guides.
+Transform any YouTube video into a comprehensive guide, blog post, summary, or structured notes.
 
-## Core Behavior
+## Automatic Processing
 
-**AUTOMATIC PROCESSING**: When a user shares a YouTube URL, immediately begin transcript extraction and content generation.
+When a user shares a YouTube URL and wants anything beyond raw text (summary, guide, blog, notes), use this skill immediately.
 
-**OUTPUT TARGET**: Generate comprehensive step-by-step guides of 2000-6000 words.
+## Output Styles
 
-**CODE TREATMENT**: For every code snippet, show BOTH:
-1. Original code exactly as shown in the video
-2. Enhanced version with error handling, comments, and best practices
+| Style | When to use | Length |
+|-------|-------------|--------|
+| `guide` | Technical tutorials, how-to videos (default) | 900–2000 words |
+| `blog` | Medium-style write-up | 900–2000 words |
+| `summary` | Quick overview, "just the key points" | 600–900 words |
+| `bullets` | Structured notes, checklists | Concise bullets |
 
 ## Workflow
 
-### 1. Extract Transcript
-Use the youtube-transcript skill to extract the full transcript.
+### Step 1 — Parse user intent
+- Extract the YouTube URL or video ID from the message
+- Determine desired style from keywords:
+  - "summarize / summary / key points" → `summary`
+  - "blog post / write up / Medium" → `blog`
+  - "notes / bullet points / outline" → `bullets`
+  - "guide / tutorial / explain / how to / break down" → `guide` (default)
 
-### 2. Intelligent Content Analysis
-Analyze the transcript to identify:
-- Video type: Tutorial, concept explanation, tool demo, architecture discussion
-- Complexity level: Beginner, intermediate, or advanced
-- Main topic and learning objectives
-- Key concepts and technical principles
-- All technologies, frameworks, libraries mentioned
-- Code examples with full context
-- Step-by-step processes
+### Step 2 — Call the tool
 
-### 3. Generate Comprehensive Guide
+Call `youtube_tech_summarizer_tool` with:
+- Just the URL → uses default `guide` style
+- Or JSON for explicit style: `{"url": "https://...", "style": "blog"}`
 
-Structure:
-- Title, metadata, table of contents
-- What you'll learn + prerequisites
-- Core concept explanation
-- Project overview / architecture
-- Step-by-step implementation (original + enhanced code for each step)
-- Complete code walkthrough
-- Configuration and setup
-- Testing
-- Real-world use cases
-- Best practices and pitfalls
-- Key takeaways, resources, next steps, FAQ, conclusion
+### Step 3 — Present the result
 
-## Length Targets
-- Short videos (< 10 min): 2000-3000 words
-- Medium videos (10-30 min): 3000-4500 words
-- Long videos (> 30 min): 4500-6000 words
+**On success:** Display `result["summary"]` directly — it is already formatted Markdown.
+
+**On IpBlocked error:**
+- Tell the user: "YouTube is blocking requests from this server's IP. Upload a `cookies.txt` file in the sidebar (▶ YouTube Access section) to fix this."
+- Do NOT suggest alternatives that won't work either.
+
+**On success with extraction_method = "ytdlp":** Note that yt-dlp was used as fallback.
+
+## Output Format
+
+Present the `summary` field from the tool result directly. Do not re-wrap it or add extra headers — the content is already structured.
+
+Add a footer line:
+```
+---
+*Source: [video_url] | Style: [style] | Transcript: [word_count] words*
+```

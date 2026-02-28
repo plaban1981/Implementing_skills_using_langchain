@@ -5,6 +5,7 @@ app.py — LangChain Skills Agent with Token Usage + Dynamic Skill API Keys
 import os
 import sys
 import importlib
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -35,8 +36,8 @@ _DEFAULTS = {
     "creation_result":    None,
     "token_history":      [],
     "_pending_rerun":     False,
-    # Stores skill API key values entered by the user so they survive reruns
     "skill_keys":         {},    # { "SERPAPI_API_KEY": "value", ... }
+    "yt_cookies_path":    None,  # path to uploaded cookies.txt on disk
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -116,6 +117,53 @@ with st.sidebar:
     )
     if _gemini_val:
         os.environ["GOOGLE_API_KEY"] = _gemini_val
+
+    # ── 1b. YouTube cookies (fixes IpBlocked on cloud deployments) ───────────
+    st.divider()
+    st.subheader("🎬 YouTube Access")
+    _yt_cookies_path = st.session_state.get("yt_cookies_path")
+    _cookies_status  = "✅ Loaded" if _yt_cookies_path and Path(_yt_cookies_path).exists() else "⚠️ Not set"
+    with st.expander(f"cookies.txt — {_cookies_status}", expanded=not bool(_yt_cookies_path)):
+        st.markdown("""
+**Why?** Streamlit Cloud IPs are blocked by YouTube (`IpBlocked`).
+Uploading your browser's `cookies.txt` lets the app authenticate
+as your account, bypassing the IP restriction.
+
+**How to export:**  
+1. Install the **Get cookies.txt LOCALLY** Chrome/Firefox extension  
+2. Visit [youtube.com](https://youtube.com) while logged in  
+3. Click the extension → Export → save as `cookies.txt`  
+4. Upload below ↓
+        """)
+        _uploaded_cookies = st.file_uploader(
+            "Upload cookies.txt",
+            type=["txt"],
+            key="yt_cookies_uploader",
+            help="Netscape-format cookies file exported from your browser",
+        )
+        if _uploaded_cookies is not None:
+            # Save to a temp file that persists for the session
+            _cookies_dir  = Path(tempfile.gettempdir()) / "yt_cookies"
+            _cookies_dir.mkdir(exist_ok=True)
+            _cookies_file = _cookies_dir / "cookies.txt"
+            _cookies_file.write_bytes(_uploaded_cookies.read())
+            st.session_state["yt_cookies_path"] = str(_cookies_file)
+            os.environ["YT_COOKIES_FILE"] = str(_cookies_file)
+            st.success("✅ cookies.txt saved — YouTube skills will use it automatically.")
+        elif _yt_cookies_path and Path(_yt_cookies_path).exists():
+            os.environ["YT_COOKIES_FILE"] = _yt_cookies_path
+            st.success(f"✅ Using cookies from this session.")
+            if st.button("🗑️ Remove cookies", key="remove_cookies"):
+                try:
+                    Path(_yt_cookies_path).unlink()
+                except Exception:
+                    pass
+                st.session_state["yt_cookies_path"] = None
+                os.environ.pop("YT_COOKIES_FILE", None)
+                st.rerun()
+        else:
+            st.info("No cookies uploaded. YouTube may work without them for non-cloud deployments.")
+            os.environ.pop("YT_COOKIES_FILE", None)
 
     # ── 2. Skill-specific API keys ────────────────────────────────────────────
     _reg = get_registry()

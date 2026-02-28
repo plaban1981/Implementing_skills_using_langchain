@@ -246,6 +246,27 @@ def read_skill_instructions(skill_name: str) -> str:
 
 
 @tool
+def youtube_tech_summarizer_tool(input_value: str) -> str:
+    """
+    Generate a comprehensive guide, blog post, summary, or bullet-point notes from a YouTube video.
+    Use for: technical tutorials, AI/ML videos, coding demos, architecture talks.
+    Input: YouTube URL or video ID. Optionally JSON: {"url": "...", "style": "guide|blog|summary|bullets"}
+    """
+    scripts_dir = PROJECT_ROOT / "skills" / "youtube-tech-summarizer" / "scripts"
+    sys.path.insert(0, str(scripts_dir))
+    try:
+        import youtube_tech_summarizer as yts
+        importlib.reload(yts)
+        result = yts.run_youtube_tech_summarizer(input_value)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e), "error_type": type(e).__name__})
+    finally:
+        if str(scripts_dir) in sys.path:
+            sys.path.remove(str(scripts_dir))
+
+
+@tool
 def web_page_scraper_tool(input_value: str) -> str:
     """Searches for and scrapes web pages to extract titles, headers, and main text content."""
     import sys
@@ -288,6 +309,7 @@ def business_url_hybrid_search_tool(input_value: str) -> str:
 TOOLS_LIST = [
     business_url_hybrid_search_tool,
     web_page_scraper_tool,
+    youtube_tech_summarizer_tool,
     extract_youtube_transcript,
     extract_youtube_transcript_with_timestamps,
     list_available_skills,
@@ -634,7 +656,7 @@ def run_agent(
         "token_usage":        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
 
-    final_state = compiled.invoke(initial_state, config={"recursion_limit": 8})
+    final_state = compiled.invoke(initial_state, config={"recursion_limit": 12})
 
     # ── Extract clean text from the final message ─────────────────────────────
     last_msg      = final_state["messages"][-1]

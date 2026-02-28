@@ -1,71 +1,62 @@
 ---
 name: youtube-transcript
-description: Extract transcripts, captions, and metadata from YouTube videos using the youtube-transcript-api Python library. Use when users share YouTube links requesting summaries, guides, explanations, transcripts, or content about videos. Automatically extracts transcripts, analyzes content, and provides comprehensive video summaries. Works directly without requiring MCP server installation.
+description: Extract the plain transcript or timestamped captions from any YouTube video.
+             Trigger when the user shares a YouTube URL or video ID and asks for:
+             transcript, captions, subtitles, timestamped transcript, full text of a video,
+             what was said in a video, or copy/paste-able text from a video.
+             DO NOT use this for summaries, guides, or blog posts — use youtube-tech-summarizer for those.
 ---
 
 # YouTube Transcript Extraction
 
-## Overview
-
-Extract transcripts and analyze YouTube videos using the `youtube-transcript-api` Python library.
-
 ## Automatic Processing
 
-**CRITICAL**: When a user shares a YouTube URL or video ID, immediately begin transcript extraction without asking for confirmation. The workflow is fully automated.
+When a user shares a YouTube URL or video ID and wants the raw transcript or captions, immediately extract it. Do NOT ask for confirmation.
 
-## Core Capabilities
+## Accepted Input Formats
 
-### 1. Automatic Transcript Extraction
-- Extract transcripts from any YouTube video with captions
-- Support for multiple languages (100+ languages)
-- Automatic fallback to available languages
-- Formatted text with natural paragraph breaks
-- Raw segments with timing information
-
-### 2. Timestamped Transcripts
-- Preserve timing information for each segment
-- HH:MM:SS formatted timestamps
-
-### 3. Content Analysis
-- Automatic summarization of video content
-- Key point extraction
-- Topic identification
-
-## Workflow
-
-### Step 1: Automatic Video ID Extraction
-
-When user provides any of these formats:
 - `https://www.youtube.com/watch?v=VIDEO_ID`
 - `https://youtu.be/VIDEO_ID`
 - `https://www.youtube.com/shorts/VIDEO_ID`
-- Just the `VIDEO_ID` (11 characters)
+- Bare 11-character video ID: `dQw4w9WgXcQ`
 
-### Step 2: Ensure Dependencies
+## Workflow
 
-```bash
-pip install youtube-transcript-api
+### Step 1 — Determine what the user wants
+- **Plain transcript** → call `extract_youtube_transcript`
+- **Timestamped transcript** → call `extract_youtube_transcript_with_timestamps`
+- If unclear, default to `extract_youtube_transcript`
+
+### Step 2 — Call the tool
+Call the appropriate tool with the full URL or video ID exactly as provided.
+
+### Step 3 — Present the result
+
+**On success:**
+- Show the transcript clearly formatted
+- Include metadata: language, word count, extraction method
+- If truncated, note that clearly
+
+**On IpBlocked error:**
+- Tell the user: "YouTube is blocking requests from this server's IP. Upload a `cookies.txt` file in the sidebar (▶ YouTube Access) to fix this."
+
+**On "Transcripts disabled":**
+- Tell the user the video creator has disabled captions
+
+## Output Format
+
+```
+## 📝 Transcript — [Video ID]
+
+**Language:** [language]  **Words:** [count]  **Method:** [api/ytdlp]
+
+---
+
+[full transcript text]
 ```
 
-### Step 3: Extract Transcript
-
-Use the provided script to extract the transcript:
-
-```python
-from skills.youtube-transcript.scripts.extract_transcript import get_transcript, extract_video_id
-video_id = extract_video_id("VIDEO_URL")
-result = get_transcript(video_id)
+For timestamped:
 ```
-
-### Step 4: Process and Present
-
-Based on the user's request:
-- **Transcript only**: Present the formatted transcript
-- **Summary requested**: Analyze and summarize the content
-- **Timestamped content**: Include timing references
-
-## Error Handling
-
-- **"Transcripts are disabled"**: Inform user, suggest alternatives
-- **"Video unavailable"**: Verify video URL
-- **"No transcripts available"**: Try again later
+[00:00] First line of transcript
+[00:05] Next line...
+```
