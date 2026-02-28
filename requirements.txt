@@ -6,3 +6,4 @@ youtube-transcript-api>=0.6.0
 streamlit>=1.30.0
 bs4
 ddgs
+duckduckgo_search
