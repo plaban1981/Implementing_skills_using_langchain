@@ -121,52 +121,62 @@ with st.sidebar:
     # ── 1b. YouTube cookies (fixes IpBlocked on cloud deployments) ───────────
     st.divider()
     st.subheader("🎬 YouTube Access")
-    _yt_cookies_path = st.session_state.get("yt_cookies_path")
-    _cookies_status  = "✅ Loaded" if _yt_cookies_path and Path(_yt_cookies_path).exists() else "⚠️ Not set"
-    with st.expander(f"cookies.txt — {_cookies_status}", expanded=not bool(_yt_cookies_path)):
-        st.markdown("""
-**Why?** Streamlit Cloud IPs are blocked by YouTube (`IpBlocked`).
-Uploading your browser's `cookies.txt` lets the app authenticate
-as your account, bypassing the IP restriction.
 
-**How to export:**  
-1. Install the **Get cookies.txt LOCALLY** Chrome/Firefox extension  
-2. Visit [youtube.com](https://youtube.com) while logged in  
-3. Click the extension → Export → save as `cookies.txt`  
-4. Upload below ↓
-        """)
-        _uploaded_cookies = st.file_uploader(
-            "Upload cookies.txt",
-            type=["txt"],
-            key="yt_cookies_uploader",
-            help="Netscape-format cookies file exported from your browser",
-        )
-        if _uploaded_cookies is not None:
-            # Save to a fixed well-known path (survives Streamlit reruns within session)
-            _cookies_dir  = Path(tempfile.gettempdir()) / "langchain_skills_yt"
-            _cookies_dir.mkdir(parents=True, exist_ok=True)
-            _cookies_file = _cookies_dir / "cookies.txt"
-            _cookies_file.write_bytes(_uploaded_cookies.getvalue())
-            st.session_state["yt_cookies_path"] = str(_cookies_file)
-            os.environ["YT_COOKIES_FILE"] = str(_cookies_file)
-            st.success("✅ cookies.txt saved — YouTube skills will use it automatically.")
-            st.rerun()
-        elif _yt_cookies_path and Path(_yt_cookies_path).exists():
-            # Re-apply on every script run (Streamlit reruns clear os.environ changes)
-            os.environ["YT_COOKIES_FILE"] = _yt_cookies_path
-            _n_lines = sum(1 for l in Path(_yt_cookies_path).read_text().splitlines() if l and not l.startswith('#'))
-            st.success(f"✅ {_n_lines} cookies active this session.")
+    # Always re-apply cookies to os.environ on every rerun (env changes don't persist)
+    _yt_cookies_path = st.session_state.get("yt_cookies_path")
+    if _yt_cookies_path and Path(_yt_cookies_path).exists():
+        os.environ["YT_COOKIES_FILE"] = _yt_cookies_path
+    else:
+        os.environ.pop("YT_COOKIES_FILE", None)
+        _yt_cookies_path = None
+
+    _cookies_active = bool(_yt_cookies_path)
+    _cookies_status = "✅ Active" if _cookies_active else "⚠️ Not set"
+
+    with st.expander(f"🍪 cookies.txt — {_cookies_status}", expanded=not _cookies_active):
+        if _cookies_active:
+            _n_lines = sum(
+                1 for ln in Path(_yt_cookies_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+                if ln.strip() and not ln.startswith("#")
+            )
+            st.success(f"✅ {_n_lines:,} cookies active. YouTube access is authenticated.")
             if st.button("🗑️ Remove cookies", key="remove_cookies"):
                 try:
-                    Path(_yt_cookies_path).unlink()
+                    Path(_yt_cookies_path).unlink(missing_ok=True)
                 except Exception:
                     pass
                 st.session_state["yt_cookies_path"] = None
                 os.environ.pop("YT_COOKIES_FILE", None)
                 st.rerun()
         else:
-            st.info("No cookies uploaded. YouTube may work without them for non-cloud deployments.")
-            os.environ.pop("YT_COOKIES_FILE", None)
+            st.markdown("""
+**Why?** Streamlit Cloud IPs are blocked by YouTube (`IpBlocked`).
+Uploading your browser’s `cookies.txt` lets the app authenticate
+as your Google account, bypassing the IP restriction.
+
+**How to export:**
+1. Install **Get cookies.txt LOCALLY** (Chrome/Firefox extension)
+2. Visit [youtube.com](https://youtube.com) while logged in
+3. Click extension → Export → save as `cookies.txt`
+4. Upload below ↓
+            """)
+            _uploaded = st.file_uploader(
+                "Upload cookies.txt",
+                type=["txt"],
+                key="yt_cookies_uploader",
+                help="Netscape-format cookie file from your browser",
+            )
+            if _uploaded is not None:
+                # Save to disk immediately — DO NOT rerun here, just update state
+                _cookies_dir = Path(tempfile.gettempdir()) / "langchain_skills_yt"
+                _cookies_dir.mkdir(parents=True, exist_ok=True)
+                _saved = _cookies_dir / "cookies.txt"
+                _saved.write_bytes(_uploaded.getvalue())
+                st.session_state["yt_cookies_path"] = str(_saved)
+                os.environ["YT_COOKIES_FILE"] = str(_saved)
+                st.success("✅ Saved! Cookies are now active for this session.")
+                # Use a flag to rerun AFTER rendering completes — never mid-sidebar
+                st.session_state["_pending_rerun"] = True
 
     # ── 2. Skill-specific API keys ────────────────────────────────────────────
     _reg = get_registry()
