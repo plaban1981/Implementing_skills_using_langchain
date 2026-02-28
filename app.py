@@ -37,7 +37,8 @@ _DEFAULTS = {
     "token_history":      [],
     "_pending_rerun":     False,
     "skill_keys":         {},    # { "SERPAPI_API_KEY": "value", ... }
-    "yt_cookies_path":    None,  # path to uploaded cookies.txt on disk
+    "yt_cookies_path":    None,  # path to cookies.txt written on disk this session
+    "yt_cookies_bytes":   None,  # raw bytes of cookies.txt — survives all reruns
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -122,30 +123,35 @@ with st.sidebar:
     st.divider()
     st.subheader("🎬 YouTube Access")
 
-    # Always re-apply cookies to os.environ on every rerun (env changes don't persist)
-    _yt_cookies_path = st.session_state.get("yt_cookies_path")
-    if _yt_cookies_path and Path(_yt_cookies_path).exists():
-        os.environ["YT_COOKIES_FILE"] = _yt_cookies_path
+    # ── Re-materialise cookies on EVERY rerun ────────────────────────────────
+    # Streamlit Cloud: os.environ and /tmp both reset between script reruns.
+    # We store the raw bytes in session_state (which persists) and re-write
+    # the file + env var at the top of every execution.
+    _yt_bytes = st.session_state.get("yt_cookies_bytes")
+    if _yt_bytes:
+        _cookies_dir = Path(tempfile.gettempdir()) / "langchain_skills_yt"
+        _cookies_dir.mkdir(parents=True, exist_ok=True)
+        _cookies_disk = _cookies_dir / "cookies.txt"
+        _cookies_disk.write_bytes(_yt_bytes)          # re-write on every run
+        st.session_state["yt_cookies_path"] = str(_cookies_disk)
+        os.environ["YT_COOKIES_FILE"] = str(_cookies_disk)
     else:
+        st.session_state["yt_cookies_path"] = None
         os.environ.pop("YT_COOKIES_FILE", None)
-        _yt_cookies_path = None
 
-    _cookies_active = bool(_yt_cookies_path)
+    _cookies_active = bool(_yt_bytes)
     _cookies_status = "✅ Active" if _cookies_active else "⚠️ Not set"
 
     with st.expander(f"🍪 cookies.txt — {_cookies_status}", expanded=not _cookies_active):
         if _cookies_active:
             _n_lines = sum(
-                1 for ln in Path(_yt_cookies_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+                1 for ln in _yt_bytes.decode("utf-8", errors="ignore").splitlines()
                 if ln.strip() and not ln.startswith("#")
             )
-            st.success(f"✅ {_n_lines:,} cookies active. YouTube access is authenticated.")
+            st.success(f"✅ {_n_lines:,} cookie entries active. YouTube is authenticated.")
             if st.button("🗑️ Remove cookies", key="remove_cookies"):
-                try:
-                    Path(_yt_cookies_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-                st.session_state["yt_cookies_path"] = None
+                st.session_state["yt_cookies_bytes"] = None
+                st.session_state["yt_cookies_path"]  = None
                 os.environ.pop("YT_COOKIES_FILE", None)
                 st.rerun()
         else:
@@ -167,16 +173,18 @@ as your Google account, bypassing the IP restriction.
                 help="Netscape-format cookie file from your browser",
             )
             if _uploaded is not None:
-                # Save to disk immediately — DO NOT rerun here, just update state
+                # Store raw bytes in session_state — this survives ALL reruns
+                _raw = _uploaded.getvalue()
+                st.session_state["yt_cookies_bytes"] = _raw
+                # Write to disk and set env var immediately for this run
                 _cookies_dir = Path(tempfile.gettempdir()) / "langchain_skills_yt"
                 _cookies_dir.mkdir(parents=True, exist_ok=True)
                 _saved = _cookies_dir / "cookies.txt"
-                _saved.write_bytes(_uploaded.getvalue())
+                _saved.write_bytes(_raw)
                 st.session_state["yt_cookies_path"] = str(_saved)
                 os.environ["YT_COOKIES_FILE"] = str(_saved)
-                st.success("✅ Saved! Cookies are now active for this session.")
-                # Use a flag to rerun AFTER rendering completes — never mid-sidebar
-                st.session_state["_pending_rerun"] = True
+                st.success("✅ Saved! YouTube is now authenticated.")
+                st.session_state["_pending_rerun"] = True   # refresh sidebar status
 
     # ── 2. Skill-specific API keys ────────────────────────────────────────────
     _reg = get_registry()

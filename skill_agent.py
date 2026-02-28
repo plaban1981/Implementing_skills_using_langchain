@@ -324,18 +324,38 @@ def reload_tools():
     """
     Rebuild TOOLS and TOOL_MAP after create_skill.py has injected a new @tool stub.
     Called by app.py so the new skill is live in chat immediately.
+
+    Handles both local (module key = 'skill_agent') and Streamlit Cloud
+    (module key = full dotted path like 'implementing_skills_using_langchain.skill_agent')
+    by searching all sys.modules values for this file's path.
     """
     global TOOLS, TOOL_MAP, AGENT_GRAPH
-    module_name = Path(__file__).stem
-    if module_name in sys.modules:
-        mod      = importlib.reload(sys.modules[module_name])
-        TOOLS    = mod.TOOLS_LIST
-        TOOL_MAP = {t.name: t for t in TOOLS}
-    else:
+
+    this_file = Path(__file__).resolve()
+    reloaded  = False
+
+    # Search every loaded module for one whose __file__ matches ours
+    for key, mod in list(sys.modules.items()):
+        mod_file = getattr(mod, "__file__", None)
+        if mod_file and Path(mod_file).resolve() == this_file:
+            try:
+                mod      = importlib.reload(mod)
+                TOOLS    = mod.TOOLS_LIST
+                TOOL_MAP = {t.name: t for t in TOOLS}
+                reloaded = True
+                print(f"[SkillAgent] Reloaded via key='{key}' — {len(TOOLS)} tools")
+                break
+            except Exception as e:
+                print(f"[SkillAgent] Reload failed for key='{key}': {e}")
+
+    if not reloaded:
+        # Module not in sys.modules yet — just rebuild from current globals
         TOOLS    = list(TOOLS_LIST)
         TOOL_MAP = {t.name: t for t in TOOLS}
+        print(f"[SkillAgent] Cold-build — {len(TOOLS)} tools")
+
     AGENT_GRAPH = _build_graph()
-    print(f"[SkillAgent] Reloaded — {len(TOOLS)} tools: {[t.name for t in TOOLS]}")
+    print(f"[SkillAgent] Tools active: {[t.name for t in TOOLS]}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -390,13 +410,14 @@ def build_system_prompt(registry: Optional[Dict] = None, executed_tools: Optiona
 3. After tools return results, write your final Markdown response immediately.
 4. If no skill matches, answer from your own knowledge.
 
-## STRICT Tool Usage Rules
+## ABSOLUTE Tool Usage Rules — violations cause infinite loops
 
-- Call `read_skill_instructions` EXACTLY ONCE per request — never twice.
-- Call each skill tool EXACTLY ONCE — never repeat a tool call.
-- After receiving tool results, STOP calling tools and write your response.
-- Do NOT call `read_skill_instructions` again after you already have the instructions.
-- Do NOT call the same tool twice with the same arguments.
+- Call `read_skill_instructions` EXACTLY ONCE per request — NEVER call it twice.
+- Call each skill tool EXACTLY ONCE — NEVER repeat a tool call.
+- If a tool returns an error, write the error to the user — do NOT retry with different args or a different skill.
+- After receiving ANY tool result (success OR error), STOP calling tools and write your response.
+- Do NOT fall back to a different skill if the first skill returned an error — report the error instead.
+- Do NOT call `web_page_scraper_tool` or any other skill as a workaround for a failed YouTube tool.
 
 ---
 
@@ -408,6 +429,7 @@ def build_system_prompt(registry: Optional[Dict] = None, executed_tools: Optiona
 
 - **ALWAYS** return clean Markdown text — never raw Python dicts, JSON objects, or repr strings.
 - **NEVER** include `extras`, `signature`, `type`, `id`, or base64 strings in your response.
+- When a tool returns an error, present it clearly: state the error, explain likely cause, suggest fix.
 - When a tool returns transcript text, format it clearly for the user.
 - Execute immediately — do not ask for confirmation.
 """
