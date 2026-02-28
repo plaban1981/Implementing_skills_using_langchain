@@ -51,6 +51,42 @@ def _seg(segment) -> Dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cookie-aware API factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_api_with_cookies():
+    """
+    Build a YouTubeTranscriptApi instance.
+    If YT_COOKIES_FILE is set, load the Netscape cookies file into a
+    requests.Session and inject it via http_client= (v1.x API).
+    Falls back to a plain unauthenticated instance if anything fails.
+    """
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    cookies_file = os.environ.get("YT_COOKIES_FILE", "").strip()
+    if not cookies_file or not os.path.exists(cookies_file):
+        return YouTubeTranscriptApi()
+
+    try:
+        import http.cookiejar
+        import requests
+        jar = http.cookiejar.MozillaCookieJar()
+        jar.load(cookies_file, ignore_discard=True, ignore_expires=True)
+        session = requests.Session()
+        session.cookies = jar
+        n_yt = sum(1 for c in jar if "youtube" in c.domain or "google" in c.domain)
+        print(f"[Transcript] Loaded {n_yt} YouTube/Google cookies from {cookies_file}")
+        return YouTubeTranscriptApi(http_client=session)
+    except TypeError:
+        # http_client not supported in this version — try without cookies
+        print("[Transcript] http_client not supported, trying without cookies")
+        return YouTubeTranscriptApi()
+    except Exception as e:
+        print(f"[Transcript] Cookie load failed ({e}), trying without cookies")
+        return YouTubeTranscriptApi()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Strategy 1 — youtube-transcript-api
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -62,17 +98,9 @@ def _fetch_via_api(video_id: str, languages: List[str]) -> Dict:
         return {"error": "youtube-transcript-api not installed", "_strategy": "api"}
 
     try:
-        # Use cookies file if available (bypasses IpBlocked on cloud IPs)
-        cookies_file = os.environ.get("YT_COOKIES_FILE", "")
-        if cookies_file and os.path.exists(cookies_file):
-            try:
-                from youtube_transcript_api import CookieJar
-                api = YouTubeTranscriptApi(cookie_path=cookies_file)
-            except (ImportError, TypeError):
-                # Older versions don't support cookie_path — fall through
-                api = YouTubeTranscriptApi()
-        else:
-            api = YouTubeTranscriptApi()
+        # Inject cookies via http_client (v1.x) or fall back to plain init
+        # This bypasses IpBlocked errors on cloud-hosted deployments.
+        api = _make_api_with_cookies()
         tlist = api.list(video_id)
 
         transcript = None

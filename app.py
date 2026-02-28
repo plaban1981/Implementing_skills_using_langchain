@@ -142,17 +142,20 @@ as your account, bypassing the IP restriction.
             help="Netscape-format cookies file exported from your browser",
         )
         if _uploaded_cookies is not None:
-            # Save to a temp file that persists for the session
-            _cookies_dir  = Path(tempfile.gettempdir()) / "yt_cookies"
-            _cookies_dir.mkdir(exist_ok=True)
+            # Save to a fixed well-known path (survives Streamlit reruns within session)
+            _cookies_dir  = Path(tempfile.gettempdir()) / "langchain_skills_yt"
+            _cookies_dir.mkdir(parents=True, exist_ok=True)
             _cookies_file = _cookies_dir / "cookies.txt"
-            _cookies_file.write_bytes(_uploaded_cookies.read())
+            _cookies_file.write_bytes(_uploaded_cookies.getvalue())
             st.session_state["yt_cookies_path"] = str(_cookies_file)
             os.environ["YT_COOKIES_FILE"] = str(_cookies_file)
             st.success("✅ cookies.txt saved — YouTube skills will use it automatically.")
+            st.rerun()
         elif _yt_cookies_path and Path(_yt_cookies_path).exists():
+            # Re-apply on every script run (Streamlit reruns clear os.environ changes)
             os.environ["YT_COOKIES_FILE"] = _yt_cookies_path
-            st.success(f"✅ Using cookies from this session.")
+            _n_lines = sum(1 for l in Path(_yt_cookies_path).read_text().splitlines() if l and not l.startswith('#'))
+            st.success(f"✅ {_n_lines} cookies active this session.")
             if st.button("🗑️ Remove cookies", key="remove_cookies"):
                 try:
                     Path(_yt_cookies_path).unlink()
